@@ -85,9 +85,14 @@ public class main extends Agent {
     NodeData data;
     int stage = 0;
     boolean firstTime = true;
-    static int counter = 0;
-    static int knowAllCounter = 0;
-    static boolean stopAll = false;
+    boolean stopFlag = false;
+
+    // Счетчики для стоимости
+    int memoryCells = 0; // Количество ячеек памяти
+    int iterations = 0; // Количество итераций
+    int arithmeticOps = 0; // Арифметические действия
+    int interAgentMessages = 0; // Передачи между агентами (отправки соседям)
+    int memoryWrites = 0; // Записи в память
 
     @Override
     protected void setup() {
@@ -97,8 +102,17 @@ public class main extends Agent {
 
         data = new NodeData(id, val);
 
+        // Инициализация ячеек памяти и записей
+        memoryCells += 2; // id и value
+        memoryWrites += 2; // Запись id и value
+
         addBehaviour(new ReceiveBehaviour());
         addBehaviour(new SendBehaviour(this, 4000));
+        addBehaviour(new StopBehaviour());
+
+        if (id == 1) {
+            addBehaviour(new CollectorBehaviour());
+        }
     }
 
     class SendBehaviour extends TickerBehaviour {
@@ -108,7 +122,7 @@ public class main extends Agent {
 
         @Override
         protected void onTick() {
-            if (stopAll) {
+            if (stopFlag) {
                 stop();
                 return;
             }
@@ -119,63 +133,29 @@ public class main extends Agent {
             }
 
             stage++;
+            iterations++; // Подсчет итераций
 
-            // Отправляем сообщения
             ACLMessage msg = new ACLMessage(ACLMessage.INFORM);
             try {
                 msg.setContentObject(data);
             } catch (Exception e) {}
 
-            for (int neighbor : Config.getNeighbors(data.id)) {
+            List<Integer> neighbors = Config.getNeighbors(data.id);
+            for (int neighbor : neighbors) {
                 msg.addReceiver(new jade.core.AID("node" + neighbor, jade.core.AID.ISLOCALNAME));
             }
             send(msg);
+            interAgentMessages += neighbors.size(); // Подсчет передач между агентами
 
-            // Ждем
             try {
                 Thread.sleep(3000);
             } catch (Exception e) {}
 
-            // Вывод результатов
-            synchronized (main.class) {
-                counter++;
-
-                if (counter == 1) {
-                    System.out.println("STEP " + stage);
-                }
-
-                System.out.println("Node " + data.id + " knows about " + data.known.size() + " nodes");
-
-                if (data.known.size() == Config.TOTAL_AGENTS) {
-                    knowAllCounter++;
-                }
-
-                if (counter == Config.TOTAL_AGENTS) {
-                    counter = 0;
-
-                    if (knowAllCounter == Config.TOTAL_AGENTS) {
-                        System.out.println("RESULTS");
-                        double avg = Config.getAverage();
-                        for (int i = 1; i <= Config.TOTAL_AGENTS; i++) {
-                            System.out.println("The average of node " + i + ": " + String.format("%.2f", avg));
-                        }
-                        System.out.println("Real average: " + String.format("%.2f", avg));
-                        System.out.println("Algorithm cost calculation:");
-                        System.out.println("Agent-centre - 1000");
-                        System.out.println("Agent-agent - 0.1р ");
-                        System.out.println("Arithmetic operations - 0.01");
-                        System.out.println("Memory cell - 1.  ");
-                        System.out.println("Iteration - 1.");
-                        System.out.println("Memory recording - 0.01.");
-                        System.out.println("n=15");
-                        System.out.println("Q = n*1000 + 6n*0.1 + 7n*0.01 + (2+n)*1 + 4*1 + 6n*0.01");
-                        System.out.println("Q=15023.85");
-                        stopAll = true;
-                    } else {
-                        knowAllCounter = 0;
-                    }
-                }
-            }
+            // Отправляем статус node1 с счетчиками
+            ACLMessage statusMsg = new ACLMessage(ACLMessage.REQUEST);
+            statusMsg.addReceiver(new jade.core.AID("node1", jade.core.AID.ISLOCALNAME));
+            statusMsg.setContent(stage + "," + data.id + "," + data.known.size() + "," + memoryCells + "," + iterations + "," + arithmeticOps + "," + interAgentMessages + "," + memoryWrites);
+            send(statusMsg);
         }
     }
 
@@ -187,8 +167,138 @@ public class main extends Agent {
             if (msg != null) {
                 try {
                     NodeData otherData = (NodeData) msg.getContentObject();
+                    int oldSize = data.known.size();
                     data.known.putAll(otherData.known);
+                    int newEntries = data.known.size() - oldSize;
+                    memoryCells += newEntries; // Подсчет новых ячеек памяти
+                    memoryWrites += newEntries; // Подсчет записей в память
                 } catch (Exception e) {}
+            } else {
+                block();
+            }
+        }
+
+        @Override
+        public boolean done() {
+            return false;
+        }
+    }
+
+    class StopBehaviour extends Behaviour {
+        @Override
+        public void action() {
+            ACLMessage msg = myAgent.receive(MessageTemplate.MatchPerformative(ACLMessage.CANCEL));
+
+            if (msg != null) {
+                stopFlag = true;
+            } else {
+                block();
+            }
+        }
+
+        @Override
+        public boolean done() {
+            return false;
+        }
+    }
+
+    class CollectorBehaviour extends Behaviour {
+        private HashMap<Integer, Integer> receivedKnownSizes = new HashMap<>();
+        private HashMap<Integer, int[]> receivedCounters = new HashMap<>();
+        private int currentStage = 1;
+
+        // Суммарные счетчики для стоимости (собираются от агентов)
+        private int totalMemoryCells = 0;
+        private int totalIterations = 0;
+        private int totalArithmeticOps = 0;
+        private int totalInterAgentMessages = 0;
+        private int totalMemoryWrites = 0;
+        private int centerMessages = Config.TOTAL_AGENTS; // Фиксировано n передач в центр
+
+        @Override
+        public void action() {
+            ACLMessage msg = myAgent.receive(MessageTemplate.MatchPerformative(ACLMessage.REQUEST));
+
+            if (msg != null) {
+                String[] parts = msg.getContent().split(",");
+                int msgStage = Integer.parseInt(parts[0]);
+                int id = Integer.parseInt(parts[1]);
+                int size = Integer.parseInt(parts[2]);
+                int memCells = Integer.parseInt(parts[3]);
+                int iters = Integer.parseInt(parts[4]);
+                int arithOps = Integer.parseInt(parts[5]);
+                int interMsgs = Integer.parseInt(parts[6]);
+                int memWrites = Integer.parseInt(parts[7]);
+
+                if (msgStage == currentStage) {
+                    receivedKnownSizes.put(id, size);
+                    receivedCounters.put(id, new int[]{memCells, iters, arithOps, interMsgs, memWrites});
+
+                    if (receivedKnownSizes.size() == Config.TOTAL_AGENTS) {
+                        System.out.println("STEP " + currentStage);
+                        for (int i = 1; i <= Config.TOTAL_AGENTS; i++) {
+                            System.out.println("Node " + i + " knows about " + receivedKnownSizes.get(i) + " nodes");
+                        }
+
+                        boolean allKnowAll = true;
+                        for (int s : receivedKnownSizes.values()) {
+                            if (s != Config.TOTAL_AGENTS) {
+                                allKnowAll = false;
+                                break;
+                            }
+                        }
+
+                        if (allKnowAll) {
+                            System.out.println("RESULTS");
+                            double avg = Config.getAverage();
+                            arithmeticOps += 15; // Подсчет арифметики для расчета среднего
+                            for (int i = 1; i <= Config.TOTAL_AGENTS; i++) {
+                                System.out.println("The average of node " + i + ": " + String.format("%.2f", avg));
+                            }
+                            System.out.println("Real average: " + String.format("%.2f", avg));
+
+                            // Сбор и расчет стоимости
+                            totalMemoryCells = 0;
+                            totalIterations = currentStage;
+                            totalArithmeticOps = 0;
+                            totalInterAgentMessages = 0;
+                            totalMemoryWrites = 0;
+                            for (int[] counters : receivedCounters.values()) {
+                                totalMemoryCells += counters[0];
+                                totalIterations += counters[1];
+                                totalArithmeticOps += counters[2];
+                                totalInterAgentMessages += counters[3];
+                                totalMemoryWrites += counters[4];
+                            }
+                            totalArithmeticOps += arithmeticOps;
+
+                            double cost = (totalMemoryCells * 1.0) + (currentStage * 1.0) + (totalArithmeticOps * 0.01) +
+                                    (totalInterAgentMessages * 0.1) + (totalMemoryWrites * 0.01) + (centerMessages * 1000.0);
+
+                            System.out.println("Algorithm cost calculation:");
+                            System.out.println("Agent-centre - 1000");
+                            System.out.println("Agent-agent - 0.1р ");
+                            System.out.println("Arithmetic operations - 0.01");
+                            System.out.println("Memory cell - 1.  ");
+                            System.out.println("Iteration - 1.");
+                            System.out.println("Memory recording - 0.01.");
+                            System.out.println("n=" + Config.TOTAL_AGENTS);
+                            System.out.println("Q = " + totalMemoryCells + "*1 + " + currentStage + "*1 + " + totalArithmeticOps + "*0.01 + " +totalInterAgentMessages + "*0.1 + " + totalMemoryWrites + "*0.01 + " + centerMessages + "*1000");
+                            System.out.println("Q=" + String.format("%.2f", cost));
+
+                            // Отправляем STOP всем агентам
+                            for (int i = 1; i <= Config.TOTAL_AGENTS; i++) {
+                                ACLMessage stopMsg = new ACLMessage(ACLMessage.CANCEL);
+                                stopMsg.addReceiver(new jade.core.AID("node" + i, jade.core.AID.ISLOCALNAME));
+                                send(stopMsg);
+                            }
+                        } else {
+                            receivedKnownSizes.clear();
+                            receivedCounters.clear();
+                            currentStage++;
+                        }
+                    }
+                }
             } else {
                 block();
             }
@@ -242,4 +352,3 @@ public class main extends Agent {
         }
     }
 }
-
